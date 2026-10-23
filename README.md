@@ -5,13 +5,13 @@ stage interno de Snowflake) y llega a detecciones en SQL, hunting sobre un año 
 de anomalías y fraude, triage con IA, un agente conversacional, un dashboard y gobierno del dato,
 todo dentro de Snowflake.
 
-La guía paso a paso está en [`docs/guia_estudiante.md`](docs/guia_estudiante.md).
+La guía paso a paso está en [`docs/guia_evaluador.md`](docs/guia_evaluador.md).
 
 ## Contenido
 
 | Ruta | Qué es |
 |---|---|
-| `docs/guia_estudiante.md` | Guía para replicar el laboratorio, con resultados esperados y retos |
+| `docs/guia_evaluador.md` | Guía para replicar el laboratorio, con resultados esperados y retos |
 | `generator/` | Generador de logs sintéticos (13 meses) con incidentes sembrados |
 | `sql/` | Scripts en orden de ejecución (`00` a `08`, y `99` para limpiar) |
 | `streamlit/` | Dashboard SOC para Streamlit in Snowflake |

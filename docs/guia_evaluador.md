@@ -1,4 +1,4 @@
-# Guía del estudiante · Security Data Lake en Snowflake
+# Guía del evaluador · Security Data Lake en Snowflake
 
 En este laboratorio vas a construir, en tu propia cuenta de Snowflake, un data lake de seguridad
 sobre logs que están en un bucket de S3 (o, si no tienes AWS a mano, en un stage interno de
