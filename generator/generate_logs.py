@@ -8,6 +8,7 @@ Uso:
   python generate_logs.py --local ./out            # escribe en disco
   python generate_logs.py --upload                 # sube a s3://workshop-datalake-siem
   python generate_logs.py --upload --bucket otro --scale 0.5
+  python generate_logs.py --upload --resume --workers 16   # reanuda una subida cortada
 
 Layout: <source>/YYYY/MM/DD/<source>_YYYYMMDD.<ext>.gz
 """
@@ -19,6 +20,10 @@ import io
 import json
 import random
 import string
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +31,7 @@ BUCKET = "workshop-datalake-siem"
 END_DATE = date(2026, 10, 21)
 DAYS = 395  # ~13 meses
 SEED = 42
+MAX_FILE_RETRIES = 5  # reintentos por fichero (además de los de botocore)
 
 UNITS = [("UES", "ES"), ("UBR", "BR"), ("UDE", "DE")]
 USERS = [f"{n}.{s}" for n in ["ana", "luis", "maria", "jorge", "lucia", "pablo", "elena", "david", "sara", "ivan"]
@@ -232,45 +238,142 @@ def ioc_csv(rng):
     return serialize(rows, "csv")
 
 
+class Uploader:
+    """Escritura/subida resiliente: pool acotado, reintentos con backoff y --resume.
+
+    La generación sigue siendo secuencial (un único RNG con SEED) para que la salida
+    sea determinista; sólo la E/S (S3 o disco) se hace en paralelo.
+    """
+
+    def __init__(self, a):
+        self.a = a
+        self.s3 = None
+        self.transfer = None
+        if a.upload:
+            import boto3
+            from boto3.s3.transfer import TransferConfig
+            from botocore.config import Config
+            # Reintentos adaptativos y timeouts: nunca se queda colgado esperando a S3
+            cfg = Config(retries={"mode": "adaptive", "max_attempts": 10},
+                         connect_timeout=10, read_timeout=60,
+                         max_pool_connections=max(10, a.workers * 2))
+            self.s3 = boto3.client("s3", config=cfg)
+            self.transfer = TransferConfig(multipart_threshold=8 * 1024 ** 2,
+                                           multipart_chunksize=8 * 1024 ** 2,
+                                           max_concurrency=4, use_threads=True)
+        self.pool = ThreadPoolExecutor(max_workers=a.workers)
+        # Limita los ficheros pendientes en memoria (backpressure sobre el generador)
+        self.slots = threading.BoundedSemaphore(a.workers * 4)
+        self.lock = threading.Lock()
+        self.futures = []
+        self.done = self.skipped = 0
+        self.failed = []
+
+    def _exists_same_size(self, key, size):
+        if self.s3:
+            from botocore.exceptions import ClientError
+            try:
+                return self.s3.head_object(Bucket=self.a.bucket, Key=key)["ContentLength"] == size
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                    return False
+                raise
+        path = Path(self.a.local) / key
+        return path.is_file() and path.stat().st_size == size
+
+    def _write(self, key, data):
+        if self.s3:
+            self.s3.upload_fileobj(io.BytesIO(data), self.a.bucket, key, Config=self.transfer)
+        else:
+            path = Path(self.a.local) / key
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".part")  # escritura atómica
+            tmp.write_bytes(data)
+            tmp.replace(path)
+
+    def _task(self, key, data):
+        try:
+            for attempt in range(1, MAX_FILE_RETRIES + 1):
+                try:
+                    if self.a.resume and self._exists_same_size(key, len(data)):
+                        self._progress(skipped=True)
+                        return
+                    self._write(key, data)
+                    self._progress()
+                    return
+                except Exception as e:  # noqa: BLE001 - se reintenta cualquier fallo de E/S
+                    if attempt == MAX_FILE_RETRIES:
+                        with self.lock:
+                            self.failed.append((key, repr(e)))
+                        print(f"ERROR {key}: {e!r} (tras {attempt} intentos)", file=sys.stderr, flush=True)
+                        return
+                    wait = min(30, 2 ** attempt) + random.random()  # backoff exponencial + jitter
+                    print(f"Reintento {attempt}/{MAX_FILE_RETRIES} {key} en {wait:.1f}s: {e!r}",
+                          file=sys.stderr, flush=True)
+                    time.sleep(wait)
+        finally:
+            self.slots.release()
+
+    def _progress(self, skipped=False):
+        with self.lock:
+            self.done += 1
+            self.skipped += skipped
+            if self.done % self.a.progress_every == 0:
+                print(f"[progreso] {self.done} ficheros ({self.skipped} omitidos por --resume, "
+                      f"{len(self.failed)} fallidos)", flush=True)
+
+    def put(self, key, data, compress=True):
+        if compress:
+            data = gzip.compress(data, mtime=0)  # mtime fijo: bytes deterministas (--resume por tamaño)
+        self.slots.acquire()
+        self.futures.append(self.pool.submit(self._task, key, data))
+
+    def close(self):
+        for f in self.futures:
+            f.result()
+        self.pool.shutdown(wait=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--local", help="directorio de salida local")
     p.add_argument("--upload", action="store_true", help="subir a S3")
     p.add_argument("--bucket", default=BUCKET)
     p.add_argument("--scale", type=float, default=1.0, help="multiplicador de volumen")
+    p.add_argument("--workers", type=int, default=8, help="subidas/escrituras en paralelo")
+    p.add_argument("--resume", action="store_true",
+                   help="omite objetos que ya existen con el mismo tamaño")
+    p.add_argument("--progress-every", type=int, default=100, help="línea de progreso cada N ficheros")
     a = p.parse_args()
     if not a.local and not a.upload:
         p.error("usa --local DIR o --upload")
+    if a.workers < 1 or a.progress_every < 1:
+        p.error("--workers y --progress-every deben ser >= 1")
 
-    s3 = None
-    if a.upload:
-        import boto3
-        s3 = boto3.client("s3")
-
-    def put(key, data, compress=True):
-        if compress:
-            data = gzip.compress(data)
-        if s3:
-            s3.put_object(Bucket=a.bucket, Key=key, Body=data)
-        else:
-            path = Path(a.local) / key
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-
+    up = Uploader(a)
     rng = random.Random(SEED)
     counts = {s: 0 for s in SOURCES}
-    for i in range(DAYS):
-        d = END_DATE - timedelta(days=DAYS - 1 - i)
-        for name, (fn, n, ext) in SOURCES.items():
-            rows = fn(d, rng, int(n * a.scale))
-            if not rows:
-                continue
-            counts[name] += len(rows)
-            put(f"{name}/{d:%Y/%m/%d}/{name}_{d:%Y%m%d}.{ext}.gz", serialize(rows, ext))
-    put("ioc/ioc_feed.csv.gz", ioc_csv(rng))
-    for f in sorted(Path(__file__).resolve().parent.parent.joinpath("runbooks").glob("*.md")):
-        put(f"runbooks/{f.name}", f.read_bytes(), compress=False)
+    try:
+        for i in range(DAYS):
+            d = END_DATE - timedelta(days=DAYS - 1 - i)
+            for name, (fn, n, ext) in SOURCES.items():
+                rows = fn(d, rng, int(n * a.scale))
+                if not rows:
+                    continue
+                counts[name] += len(rows)
+                up.put(f"{name}/{d:%Y/%m/%d}/{name}_{d:%Y%m%d}.{ext}.gz", serialize(rows, ext))
+        up.put("ioc/ioc_feed.csv.gz", ioc_csv(rng))
+        for f in sorted(Path(__file__).resolve().parent.parent.joinpath("runbooks").glob("*.md")):
+            up.put(f"runbooks/{f.name}", f.read_bytes(), compress=False)
+    finally:
+        up.close()
     print("Filas generadas:", json.dumps(counts, indent=1))
+    print(f"Ficheros: {up.done} procesados, {up.skipped} omitidos (--resume), {len(up.failed)} fallidos")
+    if up.failed:
+        print("Fallidos (re-ejecuta con --resume para reintentar sólo estos):", file=sys.stderr)
+        for key, err in up.failed:
+            print(f"  {key}: {err}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

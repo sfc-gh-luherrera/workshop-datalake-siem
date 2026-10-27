@@ -44,6 +44,7 @@ Cada vez que aparece un concepto nuevo, lo explicamos brevemente en un recuadro.
 | Cuenta de Snowflake | Edición Enterprise o superior. Se recomienda una región de AWS en la UE (por ejemplo `eu-west-3`, París, o `eu-central-1`, Frankfurt). Si no tienes cuenta, puedes abrir una de prueba. |
 | Rol | `ACCOUNTADMIN` para los scripts `00` y `01`, que crean roles, la integración con S3 y permisos de cuenta. El resto se ejecuta con el rol `SOC_ADMIN` que crea el propio laboratorio. |
 | Cortex (IA) | Los modelos de lenguaje tienen que estar disponibles en tu región o tener activada la inferencia entre regiones. Lo comprobamos en el paso 1. |
+| Cortex Code | El asistente de IA de Snowsight, para construir los modelos de ML y el enmascaramiento con los prompts de `prompts/`. Si no lo tienes disponible, cada paso tiene un script alternativo. |
 | AWS (opcional) | Permisos para crear un bucket de S3, una política y un rol IAM. Si no tienes AWS, usarás un stage interno y el resultado es el mismo. |
 | Equipo local | Python 3.10 o superior y `git`. Para la opción sin AWS, una conexión de Snowflake configurada (por ejemplo con Snowflake CLI, en `~/.snowflake/connections.toml`). |
 
@@ -62,6 +63,8 @@ Clona o descarga el repositorio del laboratorio. Su estructura es esta:
 | `generator/` | Generador de logs sintéticos y script de subida a un stage interno |
 | `sql/` | Scripts de preparación y de cada módulo, numerados en orden de ejecución |
 | `sql/demo_snippets/` | Las consultas de cada paso, sueltas, para pegarlas en Snowsight |
+| `sql/backup/` | Script de respaldo que crea los modelos de ML si no usas Cortex Code |
+| `prompts/` | Prompts para Cortex Code: ML de anomalías, ML de fraude y enmascaramiento |
 | `streamlit/` | Código del dashboard SOC |
 | `runbooks/` | Runbooks sintéticos que consultará la IA |
 
@@ -235,11 +238,26 @@ LIST @SECURITY_LAKE.BRONZE.S3_LOGS/dns/2026/10/;
 
 ### 1.4 Construir el resto del laboratorio (`sql/02` a `sql/08`)
 
-Ejecuta en orden los scripts `02` a `08` con el rol `SOC_ADMIN`. Cargan la capa bronze,
-construyen las capas silver y gold, crean las detecciones, entrenan los modelos de ML, preparan la
-IA y aplican el gobierno. En un warehouse XSMALL tardan unos minutos cada uno (el `04` es el más
-lento porque entrena el modelo de anomalías). Los módulos que siguen recorren lo que crean,
-explicando cada pieza y repitiendo sus consultas clave.
+Ejecuta en orden los scripts `02` a `05` con el rol `SOC_ADMIN`. Cargan la capa bronze,
+construyen las capas silver y gold, crean las detecciones y preparan el hunting. En un warehouse
+XSMALL tardan unos minutos cada uno.
+
+A continuación ejecuta `sql/backup/ml_modelos_respaldo.sql` (alrededor de un minuto). Crea los dos
+modelos de ML y sus resultados (`GOLD.EGRESS_ANOMALIES`, `GOLD.NET_ANOMALIES` y `GOLD.SIM_SCORED`).
+En los módulos 4 y 5 los volverás a construir tú mismo con Cortex Code, con los mismos nombres;
+este respaldo garantiza que los scripts siguientes tienen datos aunque algo falle. Tiene que ir
+antes de `06` a `08`: `06` consulta el modelo de fraude, `07` y el dashboard leen sus resultados y
+`08` enmascara `SIM_SCORED.msisdn`.
+
+Por último, ejecuta `06` a `08`, que preparan la IA y aplican el gobierno. Los módulos que siguen
+recorren lo que crean, explicando cada pieza y repitiendo sus consultas clave. El script `09` (clon
+y Time Travel) y `sql/demo_snippets/share.sql` no forman parte de la preparación: los ejecutarás
+en los módulos 4 y 3.
+
+> **Cortex Code.** Es el asistente de IA de Snowflake para ingeniería de datos: recibe una
+> petición en lenguaje natural, explora los objetos de la cuenta, escribe la SQL, la ejecuta con tu
+> rol activo y explica el resultado. Cada fichero de `prompts/` tiene, por paso, el prompt que hay
+> que pegar, el resultado esperado y una consulta de comprobación.
 
 Si usas la opción A, en `sql/02_bronze_load.sql` puedes descomentar el bloque de la tabla externa
 `DNS_EXT`; solo funciona con un stage externo.
@@ -269,6 +287,28 @@ segundos sin uso y puede crecer de uno a tres clústeres si hay muchas consultas
 > de cómputo que ejecuta las consultas. Los datos están guardados aparte, así que se pueden tener
 > varios warehouses de distintos tamaños leyendo los mismos datos sin copiarlos. Se paga por
 > segundo mientras el warehouse está encendido, y se apaga solo cuando nadie lo usa.
+
+En un SOC esto permite aislar cargas de trabajo. Piensa en el turno de mañana: el equipo de
+hunting lanza una búsqueda sobre doce meses de NetFlow justo cuando corre la tarea horaria de
+detecciones. Con un warehouse para cada uno (por ejemplo, `DETECT_WH` pequeño para las tasks y
+`HUNT_WH` más grande y encendido solo cuando alguien caza), ninguno frena al otro. El laboratorio
+usa un único `SOC_WH` para simplificar.
+
+Hay dos formas de crecer. *Escalar hacia arriba* (de XSMALL a LARGE) acelera una consulta pesada; lo
+harás en el módulo 4. *Escalar hacia fuera* (multi-cluster, de uno a tres clústeres en `SOC_WH`)
+no acelera ninguna consulta, sino que absorbe la concurrencia cuando muchos analistas consultan a
+la vez. El multi-cluster requiere la edición Enterprise o superior.
+
+> **Auto-suspend y facturación por segundo.** Un warehouse se suspende solo tras el tiempo de
+> inactividad configurado (aquí, 60 segundos) y se reanuda solo con la siguiente consulta. Se
+> factura por segundo, con un mínimo de 60 segundos cada vez que arranca.
+
+El guardarraíl de coste es el resource monitor `SOC_MONITOR`, que verás en el módulo 7: si alguien
+deja un warehouse grande encendido, avisa al 80 % del presupuesto y lo suspende al 100 %.
+
+**Reto.** Sin ejecutarlo, escribe el `CREATE WAREHOUSE` de un `HUNT_WH` de tamaño LARGE que se
+suspenda tras 60 segundos y arranque suspendido. Una búsqueda de 5 segundos sobre ese warehouse
+parado, ¿cuántos segundos de cómputo factura?
 
 ### 1.3 Roles
 
@@ -389,6 +429,27 @@ En producción hay tres formas habituales de usar los ficheros de un bucket: un 
 con una task; Snowpipe con auto-ingest, que carga cada fichero nuevo en cuanto S3 lo notifica; o
 tablas externas e Iceberg, que consultan los ficheros sin copiarlos.
 
+La elección depende de cuánta latencia tolera cada fuente:
+
+| Fuente del SOC | Cómo llega | Mecanismo | Latencia típica |
+|---|---|---|---|
+| Logs de firewall exportados cada noche a S3 | Ficheros diarios | `COPY INTO` programado con una task (`LOAD_DNS_DAILY` en el script `02`) | horas |
+| Logs de proxy o VPN que caen en S3 cada pocos minutos | Ficheros pequeños y continuos | Snowpipe con auto-ingest | minutos |
+| Telemetría de EDR publicada en Kafka | Mensajes, no ficheros | Snowpipe Streaming con el conector de Kafka para Snowflake | segundos |
+
+> **Snowpipe y Snowpipe Streaming.** *Snowpipe* es un servicio de carga continua sin warehouse: S3
+> notifica cada fichero nuevo y Snowflake lo carga con el mismo `COPY`. *Snowpipe Streaming* no
+> trabaja con ficheros, sino con filas: un cliente (por ejemplo, el conector de Kafka) escribe los
+> eventos directamente en la tabla y quedan consultables en segundos.
+
+Abre `sql/02_bronze_load.sql` y fíjate en cómo está escrita la carga para que sea robusta: un
+`COPY` por fuente con un `PATTERN` explícito, nunca `FORCE = TRUE` (los metadatos de carga evitan
+duplicados durante 64 días), un tope de 15 minutos por sentencia con
+`STATEMENT_TIMEOUT_IN_SECONDS = 900` y un bloque final con `LOAD_HISTORY` que indica qué fuente
+tiene ficheros pendientes o con errores. Si algo falla, se relanza solo el `COPY` de esa fuente.
+Cada fila guarda `METADATA$FILENAME` en `src_file`, así que siempre puedes volver al objeto exacto
+del bucket.
+
 ### 2.7 La capa bronze completa
 
 El script `02` ya cargó todas las fuentes. Comprueba los volúmenes:
@@ -410,6 +471,14 @@ duplicar el almacenamiento y cargarlo hace las consultas más rápidas. Se decid
 
 **Reto.** Adapta la consulta del paso 2.5 para contar, por día de octubre, cuántas consultas DNS
 tienen más de 40 caracteres, leyendo los ficheros en sitio.
+
+**Reto.** Ejecuta el bloque de verificación del final de `sql/02_bronze_load.sql`. ¿Qué fuente
+tiene ficheros pendientes o con errores? Ejecuta otra vez el `COPY` de `DNS_RAW` del script: ¿cuántas
+filas carga y por qué?
+
+**Reto.** Clasifica estas fuentes por mecanismo de ingesta (`COPY` programado, Snowpipe o Snowpipe
+Streaming): auditoría diaria de Office 365 exportada a S3, alertas de EDR en un topic de Kafka y
+logs de proxy que se escriben en S3 cada cinco minutos.
 
 ---
 
@@ -466,6 +535,51 @@ vez.
 > de una tabla según su antigüedad, ya sea para borrarlas o para moverlas a un almacenamiento de
 > archivo más barato.
 
+Al final de la sección de retención, el script `03` deja comentada una variante COLD,
+`SLP_RAW_90D_COLD`, pensada para logs que pasado un tiempo solo se piden por un requerimiento legal
+o un análisis forense. COLD cuesta aproximadamente una cuarta parte de COOL, pero exige un mínimo de
+180 días en archivo, solo está disponible en AWS y GCP y la recuperación puede tardar hasta 48
+horas. Lo archivado no se consulta directamente: se restaura a una tabla nueva con
+`CREATE TABLE ... FROM ARCHIVE OF ...` y un `WHERE` obligatorio. No la ejecutes sobre `DNS_RAW`: el
+nivel de archivo de una tabla no se puede cambiar una vez asignado.
+
+### 3.4 Compartir IOC con otro equipo
+
+Imagina que el CSIRT del grupo, o el SOC de otro país, quiere ver hoy las coincidencias con IOC que
+ha encontrado tu SOC. En lugar de exportar un CSV, se publica una vista segura con solo los
+agregados por indicador y se comparte en vivo. Ejecuta `sql/demo_snippets/share.sql` (unos 7
+segundos; la parte del share requiere `ACCOUNTADMIN`):
+
+```sql
+USE ROLE SOC_ADMIN;
+CREATE OR REPLACE SECURE VIEW SECURITY_LAKE.GOLD.V_IOC_HITS_SHARE AS
+SELECT indicator, class, unit, MAX(confidence) AS confidence, COUNT(*) AS hits,
+       COUNT(DISTINCT src_ip) AS hosts_afectados, MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM SECURITY_LAKE.GOLD.DET_IOC_HITS GROUP BY indicator, class, unit;
+
+USE ROLE ACCOUNTADMIN;
+CREATE SHARE IF NOT EXISTS SOC_IOC_SHARE COMMENT = 'IOC detectados por el SOC';
+GRANT USAGE ON DATABASE SECURITY_LAKE TO SHARE SOC_IOC_SHARE;
+GRANT USAGE ON SCHEMA SECURITY_LAKE.GOLD TO SHARE SOC_IOC_SHARE;
+GRANT SELECT ON VIEW SECURITY_LAKE.GOLD.V_IOC_HITS_SHARE TO SHARE SOC_IOC_SHARE;
+SHOW GRANTS TO SHARE SOC_IOC_SHARE;
+```
+
+> **Secure Data Sharing.** Un *share* da a otra cuenta de Snowflake acceso de solo lectura a objetos
+> concretos, sin copiar datos ni mover ficheros: el consumidor consulta la versión actual y el
+> proveedor puede revocarlo en cualquier momento. Una *secure view* oculta su definición al
+> consumidor y es obligatoria para compartir vistas. Entre regiones o nubes distintas se usa un
+> *listing*.
+
+**Resultado esperado:** `SHOW GRANTS TO SHARE` muestra el uso de la base de datos y del esquema y el
+`SELECT` sobre la vista, y nada más. Para añadir una cuenta consumidora se usaría
+`ALTER SHARE SOC_IOC_SHARE ADD ACCOUNTS = <ORG>.<CUENTA>`; no lo hagas si no tienes una segunda
+cuenta. Abre la vista en Catalog y revisa su propietario, su comentario y sus etiquetas: es lo que
+vería el otro equipo al encontrarla.
+
+**Reto.** ¿Por qué la vista compartida agrega por indicador y no incluye `src_ip`? ¿Qué tendrías que
+cambiar para que el CSIRT solo viera las coincidencias de la unidad UES?
+
 **Reto.** Abre `sql/03_silver_normalize.sql`, localiza cómo se extraen los campos del syslog de
 firewall con `REGEXP_SUBSTR` y escribe una consulta sobre `BRONZE.FW_RAW` que extraiga el puerto
 de destino (`dport=`) de cada línea.
@@ -475,8 +589,10 @@ de destino (`dport=`) de cada línea.
 ## Módulo 4 · Detección y hunting sobre un año
 
 **Objetivo:** escribir detecciones como código SQL, cruzar ciberinteligencia con un año de
-eventos, usar ML para detectar anomalías y operar todo de forma programada (scripts
-`sql/04_gold_detections.sql` y `sql/05_hunting_1y.sql`).
+eventos, construir con Cortex Code un modelo de ML que detecte anomalías, probar cambios de reglas
+sobre un clon, deshacer errores con Time Travel y operar todo de forma programada (scripts
+`sql/04_gold_detections.sql`, `sql/05_hunting_1y.sql` y `sql/09_timetravel_clone.sql`, y
+`prompts/ml_anomalias_salida.md`).
 
 ### 4.1 Detecciones en SQL
 
@@ -516,23 +632,55 @@ retención de 30 a 90 días, ese caso no se podría ver.
 Consulta también `GOLD.DET_SOURCE_SILENT`, que avisa cuando una fuente lleva más de doce horas sin
 enviar logs. La ausencia de datos también es un incidente.
 
-### 4.3 ML de anomalías
+### 4.3 ML de anomalías con Cortex Code
 
-```sql
-SELECT series, ts, ROUND(y/1e6,1) AS mb_out, ROUND(forecast/1e6,1) AS mb_expected,
-       ROUND(upper_bound/1e6,1) AS mb_upper, ROUND(distance,2) AS distance
-FROM SECURITY_LAKE.GOLD.NET_ANOMALIES WHERE is_anomaly ORDER BY distance DESC LIMIT 15;
-```
+La regla `DET_EXFIL` ha saltado. ¿Es el único caso o hay más subredes sacando datos de lo normal?
+Vas a construir un modelo de detección de anomalías sin escribir SQL a mano. Abre Cortex Code con
+el rol `SOC_ADMIN` y el warehouse `SOC_WH`, y pega uno a uno los cinco prompts de
+`prompts/ml_anomalias_salida.md`. Después de cada uno, ejecuta la consulta de comprobación del
+fichero.
+
+| Prompt | Qué pide | Resultado esperado |
+|---|---|---|
+| 1 | Descubrir la tabla de red | `SILVER.NETWORK_ACTIVITY`; solo `netflow` trae `bytes_out` (unas 790.000 filas) |
+| 2 | Serie diaria por subred /24 en la vista `GOLD.NET_DAILY_SUBNET`, materializada en `GOLD.EGRESS_DAILY_SUBNET` | 9 subredes, 395 días, 3.555 puntos; 3.510 anteriores al 17 de octubre |
+| 3 | Entrenar `GOLD.NET_ANOMALY_MODEL` con los días anteriores al 17 de octubre | `Instance NET_ANOMALY_MODEL successfully created` |
+| 4 | Detectar desde el 17 de octubre y guardar en `GOLD.EGRESS_ANOMALIES` | 45 filas y 2 anomalías |
+| 5 | Explicar las columnas y dibujar observado frente a banda esperada | 10.20.8 se sale de la escala el 17 de octubre |
 
 > **ML Functions.** Snowflake incluye funciones de machine learning que se entrenan y se usan con
 > SQL, sin escribir código de ciencia de datos. Aquí usamos la de detección de anomalías: aprende
 > el comportamiento normal de una serie temporal y marca los valores que se salen del intervalo
 > esperado.
 
-El modelo se entrenó con el tráfico de salida de cada subred hasta el 30 de septiembre.
-**Resultado esperado:** una anomalía muy destacada, con miles de MB de salida frente a unos pocos
-esperados, y otras tres leves (distancia de entre 4 y 5). El modelo prioriza; la decisión la sigue
-tomando el analista.
+Al terminar, revisa el resultado:
+
+```sql
+SELECT series, ts, ROUND(y/1e6,1) AS mb_out, ROUND(forecast/1e6,1) AS mb_expected,
+       ROUND(upper_bound/1e6,1) AS mb_upper, ROUND(y/forecast) AS x_sobre_previsto
+FROM SECURITY_LAKE.GOLD.EGRESS_ANOMALIES WHERE is_anomaly ORDER BY x_sobre_previsto DESC;
+```
+
+**Resultado esperado:** dos anomalías. La primera, muy destacada: la subred 10.20.8 el 17 de
+octubre, con unos 5.374 MB de salida frente a unos 5,3 MB previstos (unas 1.000 veces más). La
+segunda, menor (10.20.9 el 19 de octubre, 8,9 MB frente a un máximo de 8,2 MB), es un falso
+positivo. El modelo prioriza; la decisión la sigue tomando el analista.
+
+Para que el resto del laboratorio lea tus resultados, refresca la tabla de compatibilidad:
+
+```sql
+CREATE OR REPLACE TABLE SECURITY_LAKE.GOLD.NET_ANOMALIES COPY GRANTS AS
+SELECT * FROM SECURITY_LAKE.GOLD.EGRESS_ANOMALIES;
+```
+
+**Si no tienes Cortex Code o algo falla:** los mismos objetos ya existen, porque los creó
+`sql/backup/ml_modelos_respaldo.sql` en el paso 1.4. Ejecuta directamente la consulta anterior. Si
+Cortex Code entrena sobre la vista y devuelve `input_data is empty`, es la row access policy
+`RAP_BY_UNIT`, que filtra todo dentro del entrenamiento: pídele que entrene sobre la tabla
+`EGRESS_DAILY_SUBNET`.
+
+**Reto.** Pide a Cortex Code que repita la detección con `prediction_interval` 0,99 en lugar de
+0,999. ¿Cuántas anomalías salen ahora y qué te dice eso sobre el umbral?
 
 ### 4.4 Operación: alertas y tareas programadas
 
@@ -554,7 +702,82 @@ detecciones y escribe las alertas nuevas. Está suspendida para no consumir cré
 con `ALTER TASK SECURITY_LAKE.GOLD.DETECTIONS_HOURLY RESUME`. El script incluye también la alerta
 `SOURCE_SILENT_ALERT`, que envía un correo cuando una fuente deja de enviar.
 
-### 4.5 Hunting
+### 4.5 Probar un cambio de regla sobre un clon
+
+El turno de noche se queja de ruido y propone subir el umbral del túnel DNS de 200 a 2.000
+etiquetas distintas por día. Antes de tocar producción, clona el lake entero y prueba el cambio en
+el clon. Ejecuta el bloque A1 de `sql/09_timetravel_clone.sql`:
+
+```sql
+USE ROLE SYSADMIN;
+CREATE DATABASE SECURITY_LAKE_DEV CLONE SECURITY_LAKE;
+GRANT OWNERSHIP ON DATABASE SECURITY_LAKE_DEV TO ROLE SOC_ADMIN COPY CURRENT GRANTS;
+USE ROLE SOC_ADMIN;
+SHOW DYNAMIC TABLES IN DATABASE SECURITY_LAKE_DEV;
+SHOW TASKS IN DATABASE SECURITY_LAKE_DEV;
+```
+
+> **Zero-Copy Clone.** Un clon es una copia instantánea de una base de datos, un esquema o una
+> tabla que no duplica los datos: comparte el almacenamiento con el original y solo se paga lo que
+> cambie después.
+
+**Resultado esperado:** el clon tarda unos 28 segundos. Las dynamic tables aparecen en estado
+`SUSPENDED` y las tasks en `suspended`: el clon no ejecuta nada por su cuenta. Cuidado: las dynamic
+tables y vistas usan nombres completos (`SECURITY_LAKE....`), así que si las reanudas leerían de
+producción.
+
+Sigue con el script: redefine `SECURITY_LAKE_DEV.GOLD.DET_DNS_TUNNEL` con el umbral de 2.000, borra
+las alertas de túnel del clon, ejecuta `CALL RUN_DETECTIONS();` y compara con producción:
+
+```sql
+SELECT detection, COUNT_IF(env = 'PROD') AS prod, COUNT_IF(env = 'DEV') AS dev
+FROM (SELECT 'PROD' AS env, detection FROM SECURITY_LAKE.GOLD.ALERTS
+      UNION ALL SELECT 'DEV', detection FROM SECURITY_LAKE_DEV.GOLD.ALERTS)
+GROUP BY 1 ORDER BY 1;
+```
+
+**Para pensar:** ¿qué detección cambia y qué incidente desaparece? ¿Promoverías el cambio?
+
+### 4.6 Deshacer un error con Time Travel
+
+A mitad de turno alguien lanza un `DELETE` sin el filtro correcto y vacía la cola de alertas
+abiertas. Ejecuta el bloque A2 del script `09`, siempre sobre el clon:
+
+```sql
+USE SCHEMA SECURITY_LAKE_DEV.GOLD;
+SELECT SYSTEM$WAIT(60);            -- solo si acabas de crear el clon
+SET t_antes = CURRENT_TIMESTAMP();
+DELETE FROM ALERTS WHERE status = 'NEW';
+SET q_borrado = LAST_QUERY_ID();
+
+SELECT (SELECT COUNT(*) FROM ALERTS) AS ahora,
+       (SELECT COUNT(*) FROM ALERTS AT(OFFSET => -60)) AS hace_60_segundos,
+       (SELECT COUNT(*) FROM ALERTS BEFORE(STATEMENT => $q_borrado)) AS justo_antes_del_delete,
+       (SELECT COUNT(*) FROM ALERTS AT(TIMESTAMP => $t_antes)) AS en_t_antes;
+```
+
+> **Time Travel.** Snowflake conserva las versiones anteriores de los datos durante un periodo de
+> retención (un día por defecto, hasta 90 en Enterprise), de modo que se puede consultar una tabla
+> tal como estaba en un instante (`AT`), justo antes de una sentencia concreta (`BEFORE`) o
+> recuperar una tabla borrada con `UNDROP`. Pasado ese periodo, las tablas permanentes tienen siete
+> días de Fail-safe, recuperables solo por Soporte de Snowflake.
+
+Continúa con el script: recupera las filas con `INSERT INTO ALERTS SELECT * FROM ALERTS
+BEFORE(STATEMENT => $q_borrado) WHERE status = 'NEW'`, crea una copia de la tabla tal como estaba
+con `CLONE ... BEFORE(STATEMENT => ...)`, bórrala con `DROP TABLE` y recupérala con `UNDROP TABLE`,
+y revisa la retención de cada tabla en `INFORMATION_SCHEMA.TABLES`.
+
+El script termina con un bloque comentado que crea un clon forense,
+`SECURITY_LAKE_EVIDENCIA_20261017`, con `CLONE SECURITY_LAKE AT(TIMESTAMP => ...)`: congela el lake
+tal como estaba antes de un incidente, para conservarlo como evidencia de solo lectura. Su creación
+queda registrada en `QUERY_HISTORY` y `ACCESS_HISTORY`.
+
+**Reto.** Escribe la consulta que responda a la pregunta del informe del incidente: "¿qué alertas
+había en la cola en el instante `$t_antes`?".
+
+**Reto.** ¿Por qué `AT(OFFSET => -3600)` puede fallar sobre el clon y `BEFORE(STATEMENT => ...)` no?
+
+### 4.7 Hunting
 
 Ejecuta el script `05` paso a paso. Primero etiqueta la sesión para poder medir tus consultas
 después:
@@ -638,8 +861,9 @@ partida con `ILIKE '%action=deny%'`).
 
 ## Módulo 5 · Fraude SIM swap con ML
 
-**Objetivo:** usar un modelo de clasificación entrenado con SQL para priorizar solicitudes de
-cambio de SIM sospechosas (script `sql/06_sim_swap_ml.sql`).
+**Objetivo:** construir con Cortex Code un modelo de clasificación para priorizar solicitudes de
+cambio de SIM sospechosas (`prompts/ml_fraude_sim.md`, con `sql/06_sim_swap_ml.sql` como
+consultas de referencia).
 
 El SIM swap consiste en conseguir que el operador traslade el número de la víctima a una SIM del
 atacante, lo que le permite recibir los códigos de un solo uso del banco. Las solicitudes
@@ -650,6 +874,24 @@ posteriores llegan sin etiqueta, y son las que el modelo tiene que puntuar.
 > clasificación se entrena con una consulta SQL que le indica qué columna hay que predecir (aquí,
 > `is_fraud`) y después puntúa las filas nuevas con una probabilidad. `SHOW_FEATURE_IMPORTANCE`
 > indica qué variables pesan más en la decisión.
+
+En Cortex Code, con `SOC_ADMIN` y `SOC_WH`, pega uno a uno los prompts de
+`prompts/ml_fraude_sim.md` y ejecuta después la consulta de comprobación de cada paso:
+
+| Prompt | Qué pide | Resultado esperado |
+|---|---|---|
+| 1 | Describir `BRONZE.SIM_REQUESTS` | 58.650 filas etiquetadas (1.187 fraudes, un 2 %) y 675 sin etiquetar, del 18 al 21 de octubre |
+| 2 | Vista `GOLD.SIM_TRAIN`, sin `msisdn`, tienda ni agente como variables | 58.650 filas, 2,02 % de fraude |
+| 3 | Entrenar `GOLD.SIM_FRAUD_MODEL`, con métricas e importancia de variables | unos 15 s; `ACCOUNT_AGE_DAYS` y `REQUESTS_24H` en cabeza |
+| 4 | Puntuar las solicitudes nuevas en `GOLD.SIM_SCORED` | 675 filas, 86 con `fraud_score > 0.5` |
+| 5 | Cola de investigación y concentración por tienda y agente | un grupo destaca |
+
+`SIM_SCORED` es una tabla nueva y pierde la etiqueta PII y la máscara de `msisdn`. Tras el prompt
+4, pide a Cortex Code que ejecute el bloque final de `sql/backup/ml_modelos_respaldo.sql` para
+reaplicarlas; lo comprobarás en el módulo 7.
+
+**Si no tienes Cortex Code o algo falla:** el modelo y `SIM_SCORED` ya existen por el respaldo del
+paso 1.4; ejecuta directamente las consultas de `sql/06_sim_swap_ml.sql`.
 
 ```sql
 SELECT request_ts, msisdn, request_type, store_id, agent_id, ROUND(fraud_score,3) AS score
@@ -665,6 +907,9 @@ de separar. Con datos reales, el umbral se ajusta comparando el coste de bloquea
 legítimo con el de dejar pasar un fraude.
 
 **Reto.** Cambia el umbral de `0.5` a `0.2` y compara cuántas solicitudes entran en la cola.
+
+**Reto.** El prompt 2 excluye a propósito la tienda y el agente. ¿Por qué, si precisamente el
+anillo está en una tienda y un agente concretos?
 
 ---
 
@@ -791,7 +1036,32 @@ mismo hash, el analista puede correlacionar eventos sin ver el dato.
 > columna u objeto (por ejemplo, `DATA_SENSITIVITY = 'PII'`) y a la que se pueden asociar
 > políticas para aplicarlas de forma masiva.
 
-### 7.3 Segregación por unidad de negocio
+### 7.3 Proteger un dato nuevo con Cortex Code
+
+El equipo de fraude quiere publicar a los analistas la cola de SIM de alto riesgo, pero el
+identificador del agente comercial es un dato personal de un empleado. Vuelve a `SOC_ADMIN`
+(`USE ROLE SOC_ADMIN; USE SECONDARY ROLES ALL;`) y pega en Cortex Code los cuatro prompts de
+`prompts/enmascaramiento.md`, ejecutando la consulta de comprobación de cada paso:
+
+| Prompt | Qué pide | Resultado esperado |
+|---|---|---|
+| 1 | Inventario de políticas y etiquetas | `MASK_PII_HASH` en `AUTH_ACTIVITY.user_name`, `SIM_REQUESTS.msisdn` y `SIM_SCORED.msisdn`; `agent_id` sin proteger |
+| 2 | Vista `GOLD.V_SIM_RIESGO_AGENTES` con `SELECT` para `SOC_ANALYST` | 86 filas |
+| 3 | Política `GOVERNANCE.MASK_AGENT_ID` sobre `agent_id`, etiquetada como PII | aplicada a la vista |
+| 4 | Verificar con `SOC_ANALYST` (sin roles secundarios) y con `THREAT_HUNTER` | ver tabla siguiente |
+
+| Rol | store_id | agent_id | msisdn |
+|---|---|---|---|
+| SOC_ANALYST | S-0457 | `A-****` | `h_515a806e…` (hash) |
+| THREAT_HUNTER | S-0457 | `A-1123` | en claro |
+
+**Para pensar:** no has aplicado ninguna política a `msisdn` en la vista y aun así sale
+enmascarado. ¿Por qué?
+
+Las políticas de referencia de este módulo están en `sql/08_governance.sql`; si no tienes Cortex
+Code, puedes escribir la vista y la política a mano tomándolo como modelo.
+
+### 7.4 Segregación por unidad de negocio
 
 ```sql
 USE ROLE SOC_ANALYST;
@@ -808,7 +1078,7 @@ la consulta con `THREAT_HUNTER`: aparecen UES, UDE y UBR.
 Haz una pregunta al agente desde la sesión de `SOC_DEMO_ANALYST`: la respuesta también sale
 enmascarada y filtrada, porque el agente consulta con el rol del usuario.
 
-### 7.4 Auditoría
+### 7.5 Auditoría
 
 ```sql
 USE ROLE ACCOUNTADMIN;
@@ -827,7 +1097,7 @@ ORDER BY 1 DESC LIMIT 15;
 Esta vista tiene una latencia de hasta tres horas: tus lecturas de los pasos anteriores
 aparecerán más tarde.
 
-### 7.5 Control de coste
+### 7.6 Control de coste
 
 ```sql
 USE ROLE ACCOUNTADMIN;
@@ -844,7 +1114,7 @@ Al terminar el módulo, vuelve a tu rol habitual con `USE ROLE SOC_ADMIN; USE SE
 
 **Reto.** Revisa en `sql/08_governance.sql` la política `MASK_PII_HASH` y a qué columnas se
 aplica. Fíjate en que se aplica dos veces a `msisdn`: en `BRONZE.SIM_REQUESTS` y en
-`GOLD.SIM_SCORED`. `SIM_SCORED` se creó con `CREATE TABLE AS` en el script `06`, y una copia así
+`GOLD.SIM_SCORED`. `SIM_SCORED` se creó con `CREATE TABLE AS` en el módulo 5 (o en el respaldo), y una copia así
 no hereda el enmascaramiento de la tabla de origen. Comprueba con `SOC_ANALYST` que `msisdn` sale
 como hash en `SIM_SCORED` y que aun así puedes agrupar por él. ¿Cómo evitarías tener que acordarte
 de cada copia? Pista: asociando la política al tag `DATA_SENSITIVITY`, para que se aplique a
@@ -906,21 +1176,33 @@ alto valor de Snowflake vuelven a Splunk con Openflow.
 | El enmascaramiento o el filtrado de filas no se aplican | Tienes roles secundarios activos. Usa `USE SECONDARY ROLES NONE` o el usuario `SOC_DEMO_ANALYST`. |
 | `ACCESS_HISTORY` o el consumo de Cortex aparecen vacíos | Las vistas de `ACCOUNT_USAGE` tienen entre una y tres horas de latencia. |
 | La política de ciclo de vida no ha hecho nada | Tarda unas 24 horas en ejecutarse por primera vez. |
+| Cortex Code devuelve `input_data is empty` al entrenar el modelo de anomalías | Está entrenando sobre una vista que lee `NETWORK_ACTIVITY`, filtrada por la row access policy. Pídele que entrene sobre la tabla `GOLD.EGRESS_DAILY_SUBNET`. |
+| `msisdn` sale en claro en `SIM_SCORED` tras el módulo 5 | Al recrear la tabla se pierde la máscara. Ejecuta el bloque final de `sql/backup/ml_modelos_respaldo.sql`. |
+| `AT(OFFSET => ...)` da el error 000707 en el clon | El desplazamiento cae antes de la creación del clon. Espera con `SYSTEM$WAIT(60)` o usa `BEFORE(STATEMENT => ...)`. |
+| `CREATE DATABASE ... CLONE` falla con `SOC_ADMIN` | `SOC_ADMIN` no tiene `CREATE DATABASE`. Clona con `SYSADMIN` y cede la propiedad, como hace el script `09`. |
+| `CREATE SHARE` falla por permisos | Requiere `ACCOUNTADMIN` o el privilegio `CREATE SHARE`. |
 
 ---
 
 ## Limpieza
 
-Cuando termines, suspende lo que consume y borra el usuario de prueba:
+Cuando termines, suspende lo que consume y borra el usuario de prueba, el clon, el share y los
+objetos creados con Cortex Code en el módulo 7:
 
 ```sql
 USE ROLE ACCOUNTADMIN;
 DROP USER IF EXISTS SOC_DEMO_ANALYST;
+DROP SHARE IF EXISTS SOC_IOC_SHARE;
+DROP DATABASE IF EXISTS SECURITY_LAKE_DEV;
+-- y cualquier SECURITY_LAKE_EVIDENCIA_* que hayas creado
+DROP VIEW IF EXISTS SECURITY_LAKE.GOLD.V_SIM_RIESGO_AGENTES;
+DROP MASKING POLICY IF EXISTS SECURITY_LAKE.GOVERNANCE.MASK_AGENT_ID;
 ALTER TASK SECURITY_LAKE.GOLD.DETECTIONS_HOURLY SUSPEND;
 ALTER WAREHOUSE SOC_WH SUSPEND;
 ```
 
-Para desmontarlo todo, ejecuta `sql/99_teardown.sql`. Borra la base de datos `SECURITY_LAKE` y los
+Para desmontarlo todo, ejecuta `sql/99_teardown.sql`. Borra la base de datos `SECURITY_LAKE`, el
+clon `SECURITY_LAKE_DEV`, el share `SOC_IOC_SHARE` y los
 roles, el warehouse y el resource monitor creados en el script `00`. Si usaste la opción A, borra
 también la integración (`DROP INTEGRATION S3_SIEM_INT;`), y en AWS elimina el bucket, el rol IAM y
 su política, y rota las credenciales que usaste para subir los datos.
@@ -939,7 +1221,7 @@ incidentes; los de octubre generan las diez alertas de `GOLD.ALERTS`.
 |---|---|---|---|
 | IOC histórico | 10-feb-2026 | 10.20.3.40 → update-check-srv.com | Módulo 4 (IOC y búsqueda en raw) |
 | Fuerza bruta y privilegios | 14-oct | svc_backup / 185.220.101.45 | Módulo 4 (`MATCH_RECOGNIZE`) |
-| Túnel DNS | 15 y 16-oct | 10.20.5.77 → x1f9-cdn.net | Módulo 2 (tamaño de fichero y consulta en sitio) y módulo 4 |
+| Túnel DNS | 15 y 16-oct | 10.20.5.77 → x1f9-cdn.net | Módulo 2 (tamaño de fichero y consulta en sitio), módulo 4 y clon (4.5) |
 | Descarga masiva en O365 | 16-oct | maria.lopez / 91.240.118.172 | Módulo 4 |
 | Exfiltración de 5 GB | 17-oct | 10.20.8.15 → 45.137.21.9 | Módulo 4 (regla y ML) y módulo 6 (agente) |
 | Anillo de SIM swap | 18 a 20-oct | tienda S-0457 / agente A-1123 | Módulo 5 |
@@ -963,7 +1245,7 @@ La **descarga masiva en Office 365** son quinientas descargas de SharePoint de l
 La **exfiltración de 5 GB** son cincuenta flujos de unos 100 MB entre las 3:00 y las 3:50 de la
 madrugada, desde 10.20.8.15 hacia una IP externa, con una alerta de Suricata. `DET_EXFIL` la ve
 como unas 43.000 veces la media del host, y el modelo de anomalías como 5.374 MB de salida de la
-subred 10.20.8 frente a 5,8 MB esperados.
+subred 10.20.8 frente a unos 5,3 MB previstos.
 
 El **anillo de SIM swap** son veinticinco solicitudes diarias de cambio de SIM, durante tres días,
 en la misma tienda y por el mismo agente, con dispositivo y ubicación nuevos: 75 solicitudes de
@@ -971,3 +1253,57 @@ alto riesgo que apuntan a un posible fraude interno.
 
 La **fuente silenciosa** es el firewall `fw-bcn-02`, que deja de enviar logs el 20 de octubre a
 mediodía.
+
+### Respuestas a los retos de cómputo, ingesta, compartición, ML, clon y Time Travel
+
+**Módulo 1 · `HUNT_WH`.** `CREATE WAREHOUSE HUNT_WH WAREHOUSE_SIZE = 'LARGE' AUTO_SUSPEND = 60
+INITIALLY_SUSPENDED = TRUE;`. Una búsqueda de 5 segundos sobre el warehouse parado factura 60
+segundos, porque cada arranque tiene un mínimo de un minuto; las consultas siguientes mientras siga
+encendido se facturan por segundo.
+
+**Módulo 2 · Verificación de carga.** Con los datos del laboratorio, el bloque de verificación no
+debe mostrar ficheros pendientes ni con errores en ninguna fuente. El segundo `COPY` de `DNS_RAW`
+carga 0 filas: los metadatos de carga (64 días) recuerdan los ficheros ya cargados, y por eso nunca
+se usa `FORCE = TRUE`.
+
+**Módulo 2 · Mecanismo por fuente.** Auditoría diaria de Office 365 en S3: `COPY` programado con una
+task. Logs de proxy cada cinco minutos en S3: Snowpipe con auto-ingest. Alertas de EDR en Kafka:
+Snowpipe Streaming con el conector de Kafka.
+
+**Módulo 3 · Vista compartida.** Agrega por indicador para no exponer hosts internos ni usuarios a
+otra organización: el CSIRT necesita saber qué indicador se ha visto, cuántas veces y cuándo, no qué
+máquina concreta. Para limitarla a UES, se añade `WHERE unit = 'UES'` a la vista (o una row access
+policy que tenga en cuenta la cuenta consumidora, por ejemplo con `CURRENT_ACCOUNT()`).
+
+**Módulo 4 · `prediction_interval`.** Con 0,99 la banda esperada es más estrecha y salen más
+anomalías leves; la de 10.20.8 el 17 de octubre sigue siendo, con diferencia, la primera. El umbral
+es un compromiso entre falsos positivos y casos perdidos, y lo decide el SOC.
+
+**Módulo 4 · Clon.** Cambia `dns_tunnel`: con el umbral de 2.000 desaparecen las dos alertas reales
+del túnel de 10.20.5.77 de los días 15 y 16 de octubre, que tienen unas 1.500 etiquetas distintas
+por día. El cambio no se promueve: subir el umbral habría escondido el incidente real. Producción no
+se ha tocado.
+
+**Módulo 4 · Cola en `$t_antes`.**
+
+```sql
+SELECT detection, entity, event_time, status
+FROM SECURITY_LAKE_DEV.GOLD.ALERTS AT(TIMESTAMP => $t_antes)
+ORDER BY event_time;
+```
+
+**Módulo 4 · `OFFSET` frente a `STATEMENT`.** `AT(OFFSET => -3600)` pide la tabla tal como estaba
+hace una hora, y el clon no existía entonces: Time Travel no puede ir más atrás de la creación del
+objeto (error 000707). `BEFORE(STATEMENT => ...)` apunta al instante exacto anterior al `DELETE`,
+que es posterior a la creación del clon. Además, `OFFSET` es aproximado y puede incluir otros
+cambios; `STATEMENT` es exacto.
+
+**Módulo 5 · Variables del modelo.** Si la tienda y el agente fueran variables, el modelo aprendería
+qué tiendas o agentes tuvieron fraude en el pasado, y no reconocería un anillo en una tienda nueva.
+Con variables de comportamiento (antigüedad de la cuenta, solicitudes en 24 horas, tipo, hora), el
+modelo puntúa cada solicitud por sí misma, y la concentración en S-0457 / A-1123 aparece después al
+agrupar: es una evidencia independiente del modelo.
+
+**Módulo 7 · `msisdn` en la vista.** La política `MASK_PII_HASH` está aplicada a la columna de la
+tabla base `GOLD.SIM_SCORED`, y las políticas de una tabla se aplican también a cualquier vista que
+la lea. Por eso `POLICY_REFERENCES` sobre la vista solo muestra `MASK_AGENT_ID`.

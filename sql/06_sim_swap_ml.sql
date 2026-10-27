@@ -7,29 +7,14 @@ USE ROLE SOC_ADMIN;
 USE WAREHOUSE SOC_WH;
 USE SCHEMA SECURITY_LAKE.GOLD;
 
-CREATE OR REPLACE VIEW SIM_TRAIN AS
-SELECT request_type, channel, new_device, new_location, requests_24h, account_age_days,
-       HOUR(request_ts) AS hour_of_day, is_fraud::BOOLEAN AS is_fraud
-FROM SECURITY_LAKE.BRONZE.SIM_REQUESTS
-WHERE is_fraud IS NOT NULL;
-
-CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION SIM_FRAUD_MODEL(
-  INPUT_DATA => SYSTEM$REFERENCE('VIEW', 'SIM_TRAIN'),
-  TARGET_COLNAME => 'IS_FRAUD');
+-- El modelo se construye en directo con Cortex Code: prompts/ml_fraude_sim.md
+-- Respaldo (ejecutado en la preparación): sql/backup/ml_modelos_respaldo.sql
+--   crea SIM_TRAIN, SIM_FRAUD_MODEL y SIM_SCORED (usada por 08, Streamlit y las guías)
+--   y reaplica la etiqueta PII y MASK_PII_HASH sobre SIM_SCORED.msisdn.
 
 -- Calidad del modelo e importancia de variables
 CALL SIM_FRAUD_MODEL!SHOW_EVALUATION_METRICS();
 CALL SIM_FRAUD_MODEL!SHOW_FEATURE_IMPORTANCE();
-
--- Puntuación diaria de las solicitudes nuevas
-CREATE OR REPLACE TABLE SIM_SCORED AS
-SELECT s.request_ts, s.msisdn, s.request_type, s.channel, s.store_id, s.agent_id, s.unit,
-       SIM_FRAUD_MODEL!PREDICT(INPUT_DATA => OBJECT_CONSTRUCT(
-         'REQUEST_TYPE', s.request_type, 'CHANNEL', s.channel, 'NEW_DEVICE', s.new_device,
-         'NEW_LOCATION', s.new_location, 'REQUESTS_24H', s.requests_24h,
-         'ACCOUNT_AGE_DAYS', s.account_age_days, 'HOUR_OF_DAY', HOUR(s.request_ts))):probability:"True"::FLOAT AS fraud_score
-FROM SECURITY_LAKE.BRONZE.SIM_REQUESTS s
-WHERE s.is_fraud IS NULL;
 
 -- Cola de investigación de la mañana: solicitudes de mayor riesgo
 SELECT request_ts, msisdn, request_type, store_id, agent_id, ROUND(fraud_score, 3) AS score

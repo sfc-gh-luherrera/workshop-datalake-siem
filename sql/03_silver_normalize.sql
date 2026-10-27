@@ -99,3 +99,22 @@ CREATE STORAGE LIFECYCLE POLICY IF NOT EXISTS SLP_RAW_1Y_COOL
   COMMENT = 'Raw: 1 año consultable, 5 años en archivo COOL';
 ALTER TABLE DNS_RAW ADD STORAGE LIFECYCLE POLICY SLP_RAW_1Y_COOL ON (file_ts);
 SHOW STORAGE LIFECYCLE POLICIES IN SCHEMA SECURITY_LAKE.BRONZE;
+
+-- Variante COLD (no ejecutar sobre DNS_RAW: ya tiene tier COOL y el tier no se cambia).
+-- COLD: ~1/4 del coste de COOL, mínimo 180 días en archivo, solo AWS y GCP,
+-- recuperación de hasta 48 h. Para fuentes que casi nunca se consultan (p. ej. NetFlow).
+-- CREATE STORAGE LIFECYCLE POLICY IF NOT EXISTS SLP_RAW_90D_COLD
+--   AS (ts TIMESTAMP_LTZ) RETURNS BOOLEAN -> ts < DATEADD('day', -90, CURRENT_TIMESTAMP())
+--   ARCHIVE_TIER = COLD
+--   ARCHIVE_FOR_DAYS = 2555
+--   COMMENT = 'Raw: 90 días consultable, 7 años en archivo COLD';
+-- ALTER TABLE NETFLOW_RAW ADD STORAGE LIFECYCLE POLICY SLP_RAW_90D_COLD ON (file_ts);
+-- Lo archivado no se consulta directamente: se recupera a una tabla nueva (WHERE obligatorio).
+-- Estimar antes el coste con EXPLAIN y ver metadatos sin coste:
+-- SELECT SYSTEM$GET_TABLE_ARCHIVE_METADATA('SECURITY_LAKE.BRONZE.NETFLOW_RAW');
+-- EXPLAIN CREATE TABLE NETFLOW_2025_Q4 FROM ARCHIVE OF NETFLOW_RAW AS a
+--   WHERE a.file_ts BETWEEN '2025-10-01' AND '2025-12-31';
+-- Desde COLD la restauración puede tardar hasta 48 h: ajustar la sesión antes.
+-- ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 172800, ABORT_DETACHED_QUERY = FALSE;
+-- CREATE TABLE NETFLOW_2025_Q4 FROM ARCHIVE OF NETFLOW_RAW AS a
+--   WHERE a.file_ts BETWEEN '2025-10-01' AND '2025-12-31';

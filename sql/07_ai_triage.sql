@@ -126,7 +126,7 @@ CREATE OR REPLACE MCP SERVER SOC_MCP
       description: "Preguntas de hunting y respuesta a incidentes sobre el security data lake"
   $$;
 -- URL: https://<account_url>/api/v2/databases/SECURITY_LAKE/schemas/GOLD/mcp-servers/SOC_MCP
--- OAuth para el cliente MCP: ver docs/preparacion_entorno.md
+-- OAuth para el cliente MCP: ver la documentación de Snowflake sobre servidores MCP gestionados
 
 -- 6) Gobierno de la IA (8.7): el analista solo usa lo que su rol permite
 GRANT USAGE ON AGENT SOC_AGENT TO ROLE SOC_ANALYST;
